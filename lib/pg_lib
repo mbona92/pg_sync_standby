@@ -1,0 +1,47 @@
+#!/bin/bash
+
+check_pg_conn() {
+	while [[ ${#} -ge 1 ]]
+	do
+		arg=${1}
+		case ${arg} in
+			-d)
+				shift
+				db=${1}
+				shift
+				;;
+			-h)
+				shift
+				pghost=${1}
+				shift
+				;;
+			-U)
+				shift
+				pguser=${1}
+				shift
+				;;
+			-p)
+				shift
+				pgport=${1}
+				shift
+				;;
+			*)
+				echo "ERROR: Invalid option ${arg}!"
+				;;
+		esac
+	done
+	conn_string="-d ${db:-${PGDATABASE}} -h ${pghost:-${PGHOST}} -U ${pguser:-${PGUSER}} -p ${pgport:-${PGPORT}}"
+	if ! errmsg=$(psql -A -t ${conn_string} -c "select 1" 2>&1) ; then
+		echo -e "ERROR: Unable to connect to database ${db:-${PGDATABASE}}!\nError was:\n${errmsg}"
+		return 1
+	else
+		return 0
+	fi
+}
+
+check_pg_version_num() {
+	pg_conn_string=${1}
+	psql_out_opt="-A -t -X"
+	pg_server_version_num=$(psql ${pg_conn_string} ${psql_out_opt} -c "select current_setting('server_version_num')")
+	echo ${pg_server_version_num}
+}

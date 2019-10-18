@@ -1,0 +1,154 @@
+#!/bin/bash
+
+# Requirements lsof, bzip2
+
+now() {
+	echo $(date +"%F %T.%3N")
+}
+
+check_cmd_exists() {
+	if ! $(command -v ${1} >/dev/null 2>&1); then
+		return 1
+	else
+		return 0
+	fi
+}
+
+get_log_file() {
+	_fd=${1}
+	if check_cmd_exists "lsof"; then
+		_logfile=$(lsof -a -p $$ -Fn -d${_fd} 2>/dev/null | grep -E '^n' | sed -e 's/n//')
+	else
+		echo "$(basename ${BASH_SOURCE[0]}): log: lsof command not found"
+		_logfile=""
+	fi
+}
+
+write_log() {
+	_fd=${1}
+	_log_prefix=${2}
+	get_log_file ${_fd}
+	shift
+	shift
+	_message=${*}
+	if [ -z "${_logfile}" ]; then
+		>&${_fd} echo -e "${_log_prefix} ""${_message}"
+	else
+		if [[ $(tty) != 'not a tty' && $(tty) == ${_logfile} ]]; then
+			>&${_fd} echo -e "${_log_prefix} ""${_message}"
+		else
+			>&${_fd} echo -e "<$(now)> ${_log_prefix} ""${_message}"
+		fi
+	fi
+}
+
+log() {
+	if [[ ${#} -gt 2 ]]; then
+		while [[ ${#} -gt 2 ]]
+		do
+			_arg="${1}"
+			case ${_arg} in
+				-p)
+					shift
+					_log_prefix="${1}"
+					shift
+					;;
+				*)
+					echo "log: Invalid option ${_arg} specified!"
+					exit
+					;;
+			esac
+		done
+	else
+		_log_prefix=""
+	fi
+	_log_level=${1}
+	case ${_log_level} in
+		"DIE")
+				shift
+				write_log 2 ${_log_prefix:-"ERROR:"} "${*}"
+				if [[ $(tty) != 'not a tty' && $(tty) != ${_logfile} ]]; then
+					exec 3>/dev/tty
+					>&3 echo "${_log_prefix:-"ERROR:"} Something goes wrong, check ${_logfile}!"
+				fi
+				exit 1
+				;;
+		"ERR")
+				shift
+				write_log 2 ${_log_prefix:-"ERROR:"} "${*}"
+				;;
+		"WARN")
+				shift
+				write_log 1 ${_log_prefix:-"WARNING:"} "${*}"
+				;;
+		"INFO")
+				shift
+				write_log 1 ${_log_prefix:-"INFO:"} "${*}"
+				;;
+		"*")
+				write_log 1 ${_log_prefix:-"INFO:"} "${*}"
+				;;
+	esac
+}
+
+rotate_logfile() {
+	file2rotate=${1}
+	compress=${2}
+	dest_dir=${3}
+	if [[ -f ${file2rotate} ]]; then
+		if [[ -z ${dest_dir} ]]; then
+			dest_dir=$(realpath $(dirname ${file2rotate}))
+		else
+			if [[ ! -d ${dest_dir} ]]; then
+				mkdir -p ${dest_dir}
+			fi
+		fi
+		newfile=$(echo ${dest_dir}/$(basename ${file2rotate}).$(date +"%Y%m%d_%H%M"))
+		mv ${file2rotate} ${newfile}
+		touch ${file2rotate}
+		if [[ ${compress} -gt 0 ]]; then
+			if check_cmd_exists "bzip2"; then
+				bzip2 -f ${newfile} &
+			else
+				# TODO: add support to other compression utilities
+				log WARN "Bzip2 is not installed!"
+			fi
+		fi
+	fi
+}
+
+parse_conf () {
+	declare f_label=0
+	conffile=${1}
+	label=${2}
+
+	if [[ ! -f ${conffile} ]]; then
+		log DIE "Configuration file ${conffile} does not exists!"
+	fi
+	if [[ -z ${label} ]]; then
+		f_label=1
+	else
+		if ! grep -qsE "^\[${label}\]" ${conffile} ; then
+			log DIE "Label not found in config file ${conffile}!"
+		fi 
+	fi
+	while read line
+	do
+		if [[ ${f_label} -eq 1 ]]; then
+			if [ -n ${label} ] && echo ${line} | grep -qsE '^\[.*\]$'; then
+				f_label=0
+				break
+			fi
+			echo "${line}" | grep -qs "^#" && continue
+			echo "${line}" | grep -qs "^$" && continue
+			line=$(echo "${line}" | sed -e "s/#.*$//" )
+			line=$(echo "${line}" | sed -e "s/=[[:blank:]]*/=/g ; s/[[:blank:]]*=/=/g")
+			var=$(echo ${line} | cut -f 1 -d '=')
+			val=$(echo ${line} | cut -f 2- -d '=')
+			eval ${var}=\${val}
+		fi
+		if [ -n ${label} ] && echo "${line}" | grep -qsE "^\[${label}\]"; then
+			f_label=1
+		fi
+	done < <(cat ${conffile})
+}
