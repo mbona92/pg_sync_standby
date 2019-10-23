@@ -1,5 +1,65 @@
 #!/bin/bash
 
+generate_config_file() {
+	config_file=${1}
+	if [ -f ${config_file} ]; then
+		log DIE "Configuration file ${config_file} already exists!"
+	else
+		if ! errmsg=$(touch ${config_file} 2>&1); then
+			log DIE "Cannot create file ${config_file}!\n\tError was: ${errmsg}"
+		fi
+		cat > ${config_file} <<-EOF
+		# Master connection options
+		m_pghost=
+		m_pgport=
+		m_pguser=
+		m_pgdatabase=
+
+		# Slave connection options
+		s_pghost=
+		s_pgport=
+		s_pguser=
+		s_pgdatabase=
+
+		# Sync options
+		m_host=
+		m_user=
+		exclude_file=
+		bwlimit=
+		rsync_opt=
+
+		# Other options
+		backup_label=                                       # Label passed to pg_start_backup() function
+		stop_slave=                                         # Stop slave before start sync
+		start_slave=                                        # Automatically start slave after sync is completed
+		start_cmd=                                          # Command or bash script used to start slave
+		stop_cmd=                                           # Command or bash script used to stop slave
+		fast_checkpoint=                                    # Force checkpoint as soon as possible in pg_start_backup()
+		bck_config_dir=                                     # Backup slave configuration file if it is started before start process
+		remove_slave_datafile=                              # Remove slave datafile before begin rsync
+		recovery_file=                                      # Specify a recovery.conf file to be used
+		EOF
+		if [ ${?} -eq 0 ]; then
+			return 0
+		else
+			return 1
+		fi
+	fi
+}
+
+run_custom_cmd() {
+	cmd=$(echo ${1} | sed -e 's@^"@@; s@"$@@')
+	shift
+	args=$(echo "${@}" | sed -e 's@^"@@; s@"$@@')
+	if [ -f "${cmd}" ]; then
+		bash ${cmd} ${args}
+		return ${?}
+	else
+		${cmd} ${args}
+		return ${?}
+	fi
+}
+
 get_pg_err_msg() {
 	log ERR "Sometings goes wrong!\nError was:\n$(cat ${pg_err} | sed 's/^/\t/')"
 	rm -f ${pg_err}
@@ -166,7 +226,28 @@ start_bck() {
 
 start_replica() {
 	log INFO "Starting slave database..."
-	pg_ctl start -D ${pgdata}
+	if [ -n "${start_cmd}" ]; then
+		# Run stop slave command
+		run_custom_cmd ${start_cmd}
+	else
+		# Try to start slave with pg_ctl
+		pg_ctl start -D ${pgdata}
+	fi
+	if [ ${?} -gt 0 ]; then
+		log DIE "Failed to start slave database!"
+	fi
+}
+
+add_recovery_file() {
+	if [ -n "${recovery_file}" ]; then
+		if [ ! -f ${recovery_file} ]; then
+			log DIE "Recovery file ${recovery_file} does not exists!"
+		else
+			if ! cp ${recovery_file} ${pgdata}/ ; then
+				log DIE "Failed to copy recovery file ${recovery_file} to ${pgdata}!"
+			fi
+		fi
+	fi
 }
 
 usage() {
@@ -174,18 +255,22 @@ usage() {
 	echo "   $(basename $0) [OPTION]"
 	echo
 	echo "Options:"
-	echo "  -c                     configuration file"
+	echo "  -c                     configuration file (default: $(basename $0).conf)"
 	echo "  -v                     set verbose output in rsync"
 	echo "  -L                     log file"
 	echo "  -l                     set backup label"
 	echo "  -e                     specify file containing dir or files to exclude from rsync"
 	echo "  -f                     fast checkpoint"
 	echo "  -o                     rsync options. Must be specified within double quotes"
+	echo "  -r                     specify recovery.conf file to copy within data directory"
 	echo "  --bwlimit              specify bandwith limit according to the same option of rsync"
 	echo "  --start-slave          start database when sync finish"
 	echo "  --stop-slave           start database when sync finish"
+	echo "  --start-cmd            commad or bash script used to start slave. Must be specified within double quotes if contains spaces"
+	echo "  --stop-cmd             commad or bash script used to stop slave. Must be specified within double quotes if contains spaces"
 	echo "  --conf-dir             directory used to save configuration file. Must not be inside pgdata or tablespace"
 	echo "  --empty-slave-dirs     remove slave pgdata and datafile before start sync"
+	echo "  --new-config-file      generate new configuration file with specified name (default: $(basename $0).conf)"
 	echo ""
 	echo "  --help                 display this help"
 	echo ""
@@ -210,6 +295,7 @@ usage() {
 
 declare -i f_bck_conf_file=0
 declare -i f_verbose=0
+declare -i f_generate_config_file=0
 psql_out_opt="-A -t -X"
 wdir=$(realpath $(dirname $0))
 # Load bash_lib containig some useful function
@@ -229,16 +315,8 @@ if ! check_cmd_exists lsof ; then
 	log -p "$(basename $0): " INFO "lsof command not found!"
 fi
 
-# TODO: -r (specify recovery.conf), --dry-run 
+# TODO: --dry-run
 # TODO: for each tablespace execute rsync in parallel? bwlimit?
-# TODO: custom start/stop command
-# TODO: add create config function to generate new config file
-
-if [[ ${#} -lt 1 ]]; then
-	log -p "$(basename ${0}): " ERR "You have to specify an action!"
-	usage
-	exit 1
-fi
 
 while [[ ${#} -ge 1 ]]
 do
@@ -246,7 +324,7 @@ do
 	case ${arg} in
 		-c)
 			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
 			config_file="${1}"
 			shift
 			;;
@@ -256,83 +334,89 @@ do
 			;;
 		-L)
 			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
 			log_file=${1}
-			shift
-			;;
-		-d)
-			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
-			cl_m_pgdatabase="${1}"
-			shift
-			;;
-		-h)
-			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
-			cl_m_pghost="${1}"
-			shift
-			;;
-		-p)
-			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
-			cl_m_pgport="${1}"
-			shift
-			;;
-		-u)
-			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
-			cl_m_pguser="${1}"
-			shift
-			;;
-		-D)
-			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
-			cl_s_pgdatabase="${1}"
-			shift
-			;;
-		-H)
-			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
-			cl_s_pghost="${1}"
-			shift
-			;;
-		-P)
-			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
-			cl_s_pgport="${1}"
-			shift
-			;;
-		-U)
-			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
-			cl_s_pguser="${1}"
 			shift
 			;;
 		-l)
 			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
 			cl_backup_label="${1}"
 			shift
 			;;
 		-e)
 			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
 			cl_exclude_file="${1}"
-			shift
-			;;
-		-o)
-			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
-			cl_rsync_opt="${1}"
 			shift
 			;;
 		-f)
 			shift
 			cl_fast_checkpoint="true"
 			;;
+		-o)
+			shift
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_rsync_opt="${1}"
+			shift
+			;;
+		-r)
+			shift
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_recovery_file="${1}"
+			shift
+			;;
+		-d)
+			shift
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_m_pgdatabase="${1}"
+			shift
+			;;
+		-h)
+			shift
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_m_pghost="${1}"
+			shift
+			;;
+		-p)
+			shift
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_m_pgport="${1}"
+			shift
+			;;
+		-u)
+			shift
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_m_pguser="${1}"
+			shift
+			;;
+		-D)
+			shift
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_s_pgdatabase="${1}"
+			shift
+			;;
+		-H)
+			shift
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_s_pghost="${1}"
+			shift
+			;;
+		-P)
+			shift
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_s_pgport="${1}"
+			shift
+			;;
+		-U)
+			shift
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_s_pguser="${1}"
+			shift
+			;;
 		--bwlimit)
 			shift
-			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
 			cl_bwlimit="${1}"
 			shift
 			;;
@@ -344,9 +428,31 @@ do
 			shift
 			cl_stop_slave="true"
 			;;
+		--start-cmd)
+			shift
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_start_cmd="${1}"
+			shift
+			;;
+		--stop-cmd)
+			shift
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_stop_cmd="${1}"
+			shift
+			;;
 		--empty-slave-dirs)
 			shift
 			cl_remove_slave_datafile="true"
+			;;
+		--new-config-file)
+			shift
+			if [[ -z ${1} ]]; then
+				new_config_file=$(basename $0).conf
+			else
+				new_config_file="${1}"
+			fi
+			f_generate_config_file=1
+			shift
 			;;
 		--conf-dir)
 			shift
@@ -379,8 +485,23 @@ do
 	esac
 done 
 
+if [ ${f_generate_config_file} -eq 1 ]; then
+	generate_config_file ${new_config_file}
+	if [ ${?} -eq 1 ]; then
+		log DIE "Failed to create configuration file ${new_config_file}!"
+	else
+		exit 0
+	fi
+fi
+
+# Load configuration file
 if [ -n "${config_file}" ]; then
 	parse_conf ${config_file}
+else
+	# if configuration file does not exists use default
+	if [ -f $(basename $0).conf ]; then
+		parse_conf $(basename $0).conf
+	fi
 fi
 
 if [ -n "${log_file}" ]; then
@@ -403,34 +524,46 @@ m_host=${cl_m_host:-${m_host}}
 m_user=${cl_m_user:-${m_user}}
 exclude_file=${cl_exclude_file:-${exclude_file}}
 bwlimit=${cl_bwlimit:-${bwlimit}}
-rsync_opt=${cl_rsync_opt:-${rsync_opt}}
+rsync_opt="${cl_rsync_opt:-"${rsync_opt}"}"
 backup_label=${cl_backup_label:-${backup_label}}
 stop_slave=${cl_stop_slave:-${stop_slave}}
 start_slave=${cl_start_slave:-${start_slave}}
 fast_checkpoint=${cl_fast_checkpoint:-${fast_checkpoint}}
 bck_conf_dir=${cl_bck_conf_dir:-${bck_conf_dir}}
 remove_slave_datafile=${cl_remove_slave_datafile:-${remove_slave_datafile}}
+recovery_file=${cl_recovery_file:-${recovery_file}}
 m_user=${m_user:-${m_pguser}}
 m_host=${m_host:-${m_pghost}}
-m_conn_string="-d ${m_pgdatabase} -h ${m_pghost} -U ${m_pguser} -p ${m_pgport}"
-s_conn_string="-d ${s_pgdatabase} -h ${s_pghost} -U ${s_pguser} -p ${s_pgport}"
+start_cmd="${cl_start_cmd:-"${start_cmd}"}"
+stop_cmd="${cl_stop_cmd:-"${stop_cmd}"}"
 
 # Check connection to master database
-check_pg_conn ${m_conn_string}
+check_pg_conn -d "${m_pgdatabase}" -h "${m_pghost}" -U "${m_pguser}" -p "${m_pgport}"
 [ $? -gt 0 ] && log DIE "Unable to connect to master database!"
+m_conn_string="-d ${m_pgdatabase} -h ${m_pghost} -U ${m_pguser} -p ${m_pgport}"
 # Check connection to slave database
-if $(check_pg_conn ${s_conn_string} >/dev/null ); then
+if $(check_pg_conn -d "${s_pgdatabase}" -h "${s_pghost}" -U "${s_pguser}" -p "${s_pgport}" >/dev/null ); then
+	s_conn_string="-d ${s_pgdatabase} -h ${s_pghost} -U ${s_pguser} -p ${s_pgport}"
 	# Stop slave if it is running and stop_slave is true
 	if [[ ${stop_slave} == "true" ]]; then
 		s_pgdata=$(psql ${s_conn_string} ${psql_out_opt} -c "show data_directory")
 		# Backup existing slave configuration files
-	 	[ -n "${bck_config_dir}" ] && bck_config_file "${s_conn_string}" ${s_pgdata}
+		[ -n "${bck_config_dir}" ] && bck_config_file "${s_conn_string}" ${s_pgdata}
 		if ! check_cmd_exists pg_ctl ; then
 			log DIE "pg_ctl command not found!"
 		fi
 		# Stop slave
 		log INFO "Stopping slave database..."
-		pg_ctl stop -m fast -D ${s_pgdata}
+		if [ -n "${stop_cmd}" ]; then
+			# Run stop slave command
+			run_custom_cmd ${stop_cmd}
+		else
+			# Try to stop slave with pg_ctl
+			pg_ctl stop -m fast -D ${s_pgdata}
+		fi
+		if [ ${?} -gt 0 ]; then
+			log DIE "Failed to stop slave database!"
+		fi
 	else
 		log DIE "Slave istance is running!"
 	fi
@@ -470,9 +603,14 @@ close_conn
 if [ ${f_bck_conf_file} -eq 1 ]; then
 	# Restore slave configuration files
 	restore_config_file
+	# Add recovery file if specified
+	add_recovery_file
 	# Start slave
 	[[ ${start_slave} == "true" ]] && start_replica
 else
+	# Add recovery file if specified
+	add_recovery_file
+	# Start slave
 	if [[ ${start_slave} == "true" ]]; then
 		log DIE "Cannot start slave without configutation file! Create or copy it in data directory and manually start database!"
 	fi

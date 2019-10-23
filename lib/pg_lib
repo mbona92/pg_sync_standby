@@ -8,31 +8,67 @@ check_pg_conn() {
 			-d)
 				shift
 				db=${1}
-				shift
+				if [ -z "${db}" ]; then
+					if [ -z "${PGDATABASE}" ]; then
+						echo -e "ERROR: No database specified!"
+						return 1
+					else
+						db=${PGDATABASE}
+					fi
+				else
+					shift
+				fi
 				;;
 			-h)
 				shift
 				pghost=${1}
-				shift
+				if [ -z "${pghost}" ]; then
+					if [ -z "${PGHOST}" ]; then
+						echo -e "ERROR: No host or socket directory specified to connect to database!"
+						return 1
+					else
+						pghost=${PGHOST}
+					fi
+				else
+					shift
+				fi
 				;;
 			-U)
 				shift
 				pguser=${1}
-				shift
+				if [ -z "${pguser}" ]; then
+					if [ -z "${PGUSER}" ]; then
+						echo -e "ERROR: No user specified to connect to database!"
+						return 1
+					else
+						pguser=${PGUSER}
+					fi
+				else
+					shift
+				fi
 				;;
 			-p)
 				shift
 				pgport=${1}
-				shift
+				if [ -z "${pgport}" ]; then
+					if [ -z "${PGPORT}" ]; then
+						echo -e "ERROR: No port specified to connect to database!"
+						return 1
+					else
+						pgport=${PGPORT}
+					fi
+				else
+					shift
+				fi
 				;;
 			*)
 				echo "ERROR: Invalid option ${arg}!"
 				;;
 		esac
 	done
-	conn_string="-d ${db:-${PGDATABASE}} -h ${pghost:-${PGHOST}} -U ${pguser:-${PGUSER}} -p ${pgport:-${PGPORT}}"
+	conn_string="-d ${db} -h ${pghost} -U ${pguser} -p ${pgport}"
 	if ! errmsg=$(psql -A -t ${conn_string} -c "select 1" 2>&1) ; then
-		echo -e "ERROR: Unable to connect to database ${db:-${PGDATABASE}}!\nError was:\n${errmsg}"
+		echo -e "ERROR: Unable to connect to database ${db:-${PGDATABASE}}!\n\tError was: ${errmsg}"
 		return 1
 	else
 		return 0
