@@ -38,6 +38,7 @@ generate_config_file() {
 		bck_config_dir=                                     # Backup slave configuration file if it is started before start process
 		remove_slave_datafile=                              # Remove slave datafile before begin rsync
 		recovery_file=                                      # Specify a recovery.conf file to be used
+		max_jobs=                                           # Use this many parallel jobs to rsync
 		EOF
 		if [ ${?} -eq 0 ]; then
 			return 0
@@ -111,6 +112,45 @@ make_db_conn() {
 	fi
 }
 
+run_rsync() {
+	dest=${1}
+	shift
+	temp_log_file=$(mktemp)
+	exec 10>&1 11>&2 1>${temp_log_file} 2>&1
+	cmd=${@}
+	${cmd}
+	rsync_status=${?}
+	if [[ ${rsync_status} -eq 0 || ${rsync_status} -eq 24 ]]; then
+		if [ -z "${log_file}" ]; then
+			log INFO "${dest} successfully synced!" | cut -d ' ' -f 3-
+		else
+			log INFO "${dest} successfully synced!"
+		fi
+	else
+		if [ -z "${log_file}" ]; then
+			log ERR "Something goes wrong syncing ${dest}!" | cut -d ' ' -f 3-
+		else
+			log ERR "Something goes wrong syncing ${dest}!"
+		fi
+	fi
+	exec 1>&10 11>&2 10>&- 11>&-
+	cat ${temp_log_file}
+	rm -f ${temp_log_file}
+}
+
+parallel_rsync() {
+	if [ ${r_jobs} -lt ${max_jobs} ]; then
+		( run_rsync ${@} ) &
+	fi
+	pid=${!}
+	echo ${pid} >> ${pid_file}
+	r_jobs=$(jobs -r | grep [r]sync | wc -l)
+	while [ ${r_jobs} -eq ${max_jobs} ];
+	do
+		r_jobs=$(jobs -r | grep [r]sync | wc -l)
+	done
+}
+
 copy_data () {
 	for d in $(sed 's/|/ /g' <<< "${*}" )
 	do
@@ -123,14 +163,19 @@ copy_data () {
 				rm -rf ${d}/*
 			fi
 		fi
-		log INFO "Syncing ${d}..."
 		[ ${f_verbose} -eq 1 ] && v_flag="-v"
-		rsync -aSA ${v_flag} --bwlimit=${bwlimit:-0} --delete-excluded --delete --exclude=pg_wal/* --exclude=log/* --exclude=*.conf ${exclude_list} ${m_user}@${m_host}:${d}/ ${d}/
+		parallel_rsync ${d} "rsync -aSA ${v_flag} --bwlimit=${bwlimit:-0} --delete-excluded --delete --exclude=pg_wal/* --exclude=log/* --exclude=*.conf ${exclude_list} ${m_user}@${m_host}:${d}/ ${d}/"
 	done
+	for p in $(cat ${pid_file})
+	do
+		wait ${p}
+	done
+	> ${pid_file}
 }
 
 stop_bck() {
 	pg_version=${1}
+	log INFO "Executing pg_stop_backup on master database..."
 	if [[ ${pg_version} -ge 90600 ]]; then
 		exclusive_bck="false"
 		echo "select pg_stop_backup(${exclusive_bck});" >&${pg_conn[1]}
@@ -149,6 +194,7 @@ stop_bck() {
 bck_config_file() {
 	conn_string="${1}"
 	pgdata=${2}
+	log INFO "Backing up configuration files..."
 	if [ ! -d ${bck_config_dir} ]; then
 		if ! errmsg=$(mkdir -p ${bck_config_dir}); then
 			log DIE "Cannot create ${bck_config_dir} directory to save slave configuration file!\nError was: ${errmsg}"
@@ -177,16 +223,20 @@ bck_config_file() {
 	done
 	[ -f ${pgdata}/recovery.conf ] && cp ${pgdata}/recovery.conf ${bck_config_dir}/
 	[ -f ${pgdata}/recovery.done ] && cp ${pgdata}/recovery.done ${bck_config_dir}/
-	f_bck_conf_file=1
 }
 
 restore_config_file() {
-	while read line
-	do
-		src=$(echo ${line} | cut -d ' ' -f 1)
-		dest=$(echo ${line} | cut -d ' ' -f 2)
-		cp -f ${bck_config_dir}/${src} ${dest} 
-	done < <(cat ${bck_config_dir}/conf_location_info)
+	log INFO "Restoring configuration files from ${bck_config_dir}..."
+	if [ ! -f ${bck_config_dir}/conf_location_info ]; then
+		cp ${bck_config_dir}/*.conf ${pgdata}/
+	else
+		while read line
+		do
+			src=$(echo ${line} | cut -d ' ' -f 1)
+			dest=$(echo ${line} | cut -d ' ' -f 2)
+			cp -f ${bck_config_dir}/${src} ${dest}
+		done < <(cat ${bck_config_dir}/conf_location_info)
+	fi
 	[ -f ${bck_config_dir}/recovery.conf ] && cp ${bck_config_dir}/recovery.conf ${pgdata}/
 	[ -f ${bck_config_dir}/recovery.done ] && cp ${bck_config_dir}/recovery.done ${pgdata}/
 }
@@ -200,7 +250,7 @@ exclude_file_list() {
 			exclude_list=${exclude_list}" --exclude="${line}
 		done < <( cat ${exclude_file} )
 	else
-		log ERR "exclude_file defined but does not exists!"
+		log INFO "exclude_file defined but does not exists!"
 	fi
 }
 
@@ -208,6 +258,7 @@ start_bck() {
 	label=${1}
 	f_checkpoint=${2:-false}
 	pg_version=${3}
+	log INFO "Executing pg_start_backup on master database..."
 	if [[ ${pg_version} -ge 90600 ]]; then
 		exclusive_bck="false"
 		echo "select pg_start_backup('${label}',${f_checkpoint},${exclusive_bck});" >&${pg_conn[1]}
@@ -224,7 +275,7 @@ start_bck() {
 	fi
 }
 
-start_replica() {
+start_slave_db() {
 	log INFO "Starting slave database..."
 	if [ -n "${start_cmd}" ]; then
 		# Run stop slave command
@@ -236,6 +287,21 @@ start_replica() {
 	if [ ${?} -gt 0 ]; then
 		log DIE "Failed to start slave database!"
 	fi
+}
+
+stop_slave_db() {
+			# Stop slave
+			log INFO "Stopping slave database..."
+			if [ -n "${stop_cmd}" ]; then
+				# Run stop slave command
+				run_custom_cmd ${stop_cmd}
+			else
+				# Try to stop slave with pg_ctl
+				pg_ctl stop -m fast -D ${s_pgdata}
+			fi
+			if [ ${?} -gt 0 ]; then
+				log DIE "Failed to stop slave database!"
+			fi
 }
 
 add_recovery_file() {
@@ -263,6 +329,7 @@ usage() {
 	echo "  -f                     fast checkpoint"
 	echo "  -o                     rsync options. Must be specified within double quotes"
 	echo "  -r                     specify recovery.conf file to copy within data directory"
+	echo "  -j                     use this many parallel jobs to rsync"
 	echo "  --bwlimit              specify bandwith limit according to the same option of rsync"
 	echo "  --start-slave          start database when sync finish"
 	echo "  --stop-slave           start database when sync finish"
@@ -296,8 +363,11 @@ usage() {
 declare -i f_bck_conf_file=0
 declare -i f_verbose=0
 declare -i f_generate_config_file=0
+declare -i max_jobs=1
+declare -i r_jobs=0
 psql_out_opt="-A -t -X"
 wdir=$(realpath $(dirname $0))
+pid_file=$(mktemp)
 # Load bash_lib containig some useful function
 if ! source ${wdir}/lib/bash_lib; then
 	echo "Cannot load ${wdir}/lib/bash_lib file!"
@@ -316,7 +386,6 @@ if ! check_cmd_exists lsof ; then
 fi
 
 # TODO: --dry-run
-# TODO: for each tablespace execute rsync in parallel? bwlimit?
 
 while [[ ${#} -ge 1 ]]
 do
@@ -364,6 +433,12 @@ do
 			shift
 			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
 			cl_recovery_file="${1}"
+			shift
+			;;
+		-j)
+			shift
+			[ -z "${1}" ] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_max_jobs="${1}"
 			shift
 			;;
 		-d)
@@ -504,14 +579,6 @@ else
 	fi
 fi
 
-if [ -n "${log_file}" ]; then
-	if touch "${log_file}" ]; then
-		exec 1>${log_file} 2>&1
-	else
-		log DIE "cannot create log file ${log_file}!"
-	fi
-fi
-
 m_pghost=${cl_m_pghost:-${m_pghost}}
 m_pgport=${cl_m_pgport:-${m_pgport}}
 m_pguser=${cl_m_pguser:-${m_pguser}}
@@ -536,39 +603,47 @@ m_user=${m_user:-${m_pguser}}
 m_host=${m_host:-${m_pghost}}
 start_cmd="${cl_start_cmd:-"${start_cmd}"}"
 stop_cmd="${cl_stop_cmd:-"${stop_cmd}"}"
+max_jobs="${cl_max_jobs:-"${max_jobs}"}"
+
+if [ -n "${log_file}" ]; then
+	if touch "${log_file}" ]; then
+		exec 1>${log_file} 2>&1
+	else
+		log DIE "cannot create log file ${log_file}!"
+	fi
+fi
+if [[ ${max_jobs} -le 0 ]]; then
+	log DIE "max_jobs must be grater than 0!"
+else
+	> ${pid_file}
+fi
+bwlimit_value=$(echo ${bwlimit} | sed -r 's/([0-9]+)(\w+?)/\1/')
+bwlimit_unit=$(echo ${bwlimit} | sed -r 's/([0-9]+)(\w+?)/\2/')
+if [[  ${bwlimit_value} -gt 0 ]]; then
+	bwlimit=$(echo "${bwlimit_value} ${max_jobs} ${bwlimit_unit}" | awk '{print ($1 / $2)$3}')
+fi
 
 # Check connection to master database
 check_pg_conn -d "${m_pgdatabase}" -h "${m_pghost}" -U "${m_pguser}" -p "${m_pgport}"
 [ $? -gt 0 ] && log DIE "Unable to connect to master database!"
 m_conn_string="-d ${m_pgdatabase} -h ${m_pghost} -U ${m_pguser} -p ${m_pgport}"
 # Check connection to slave database
-if $(check_pg_conn -d "${s_pgdatabase}" -h "${s_pghost}" -U "${s_pguser}" -p "${s_pgport}" >/dev/null ); then
-	s_conn_string="-d ${s_pgdatabase} -h ${s_pghost} -U ${s_pguser} -p ${s_pgport}"
-	# Stop slave if it is running and stop_slave is true
-	if [[ ${stop_slave} == "true" ]]; then
+if [[ ${stop_slave} == "true" ]]; then
+	if $(check_pg_conn -d "${s_pgdatabase}" -h "${s_pghost}" -U "${s_pguser}" -p "${s_pgport}" >/dev/null ); then
+		s_conn_string="-d ${s_pgdatabase} -h ${s_pghost} -U ${s_pguser} -p ${s_pgport}"
+		is_in_recovery=$(psql ${s_conn_string} ${psql_out_opt} -c "select pg_is_in_recovery()")
+		if [[ ${is_in_recovery} == 't' ]]; then
+			log DIE "Slave database is already in recovery mode!"
+		fi
+		# Backup slave configuration files before stop it
 		s_pgdata=$(psql ${s_conn_string} ${psql_out_opt} -c "show data_directory")
 		# Backup existing slave configuration files
 		[ -n "${bck_config_dir}" ] && bck_config_file "${s_conn_string}" ${s_pgdata}
 		if ! check_cmd_exists pg_ctl ; then
 			log DIE "pg_ctl command not found!"
 		fi
-		# Stop slave
-		log INFO "Stopping slave database..."
-		if [ -n "${stop_cmd}" ]; then
-			# Run stop slave command
-			run_custom_cmd ${stop_cmd}
-		else
-			# Try to stop slave with pg_ctl
-			pg_ctl stop -m fast -D ${s_pgdata}
-		fi
-		if [ ${?} -gt 0 ]; then
-			log DIE "Failed to stop slave database!"
-		fi
-	else
-		log DIE "Slave istance is running!"
+		stop_slave_db
 	fi
-else
-	[[ ${stop_slave} == "true" ]] && log INFO "Slave is already stopped!" 
 fi
 # Retrieve pg version from master
 m_server_version_num=$(check_pg_version_num "${m_conn_string}")
@@ -583,8 +658,6 @@ start_bck ${backup_label} ${fast_checkpoint} ${m_server_version_num}
 # Get data_directory location
 echo "show data_directory;" >&${pg_conn[1]}
 pgdata=$(get_pg_output)
-# Copy data_directory content
-copy_data ${pgdata}
 # Check if tablespaces other than pg_global and base exists
 echo "select count(*) from pg_tablespace where pg_tablespace_location(oid) <> '';" >&${pg_conn[1]}
 tbs_count=$(get_pg_output)
@@ -592,21 +665,20 @@ if [[ ${tbs_count} -gt 0 ]]; then
 	# Get tablespaces locatin
 	echo "select pg_tablespace_location(oid) from pg_tablespace where pg_tablespace_location(oid) <> '';" >&${pg_conn[1]}
 	tbs_list=$(get_pg_output)
-	# TODO: for each tablespace execute rsync in parallel?
-	# Copy tablespaces content
-	copy_data ${tbs_list}
 fi
+# Copy data_directory and tbs content
+copy_data ${pgdata}"|"${tbs_list}
 # Stop backup
 stop_bck ${m_server_version_num}
 # Close pg connection to master
 close_conn
-if [ ${f_bck_conf_file} -eq 1 ]; then
+if [ -n "${bck_config_dir}" ]; then
 	# Restore slave configuration files
 	restore_config_file
 	# Add recovery file if specified
 	add_recovery_file
 	# Start slave
-	[[ ${start_slave} == "true" ]] && start_replica
+	[[ ${start_slave} == "true" ]] && start_slave_db
 else
 	# Add recovery file if specified
 	add_recovery_file
@@ -615,3 +687,4 @@ else
 		log DIE "Cannot start slave without configutation file! Create or copy it in data directory and manually start database!"
 	fi
 fi
+rm -f ${pid_file}

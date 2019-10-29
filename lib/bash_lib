@@ -31,42 +31,50 @@ write_log() {
 	shift
 	shift
 	_message=${*}
-	if [ -z "${_logfile}" ]; then
+	if [[ -z "${_logfile}" || "${_logfile}" == $(tty) ]]; then
 		>&${_fd} echo -e "${_log_prefix} ""${_message}"
 	else
-		if [[ $(tty) != 'not a tty' && $(tty) == ${_logfile} ]]; then
-			>&${_fd} echo -e "${_log_prefix} ""${_message}"
-		else
+		if [ ! -t ${_fd} ]; then
 			>&${_fd} echo -e "<$(now)> ${_log_prefix} ""${_message}"
+		else
+			>&${_fd} echo -e "${_log_prefix} ""${_message}"
 		fi
 	fi
 }
 
 log() {
-	if [[ ${#} -gt 2 ]]; then
-		while [[ ${#} -gt 2 ]]
+	declare -a _a_log_level=(DIE ERR WARN INFO)
+	_log_prefix=""
+	if [[ ${#} -gt 0 ]]; then
+		arg_num=${#}
+		while [[ ${#} -gt 0 ]]
 		do
+			if [ ${#} -eq ${arg_num} ]; then
+				for l in "${_a_log_level[@]}"
+				do
+					if [[ ${1} == ${l} ]]; then
+						_log_level=${1}
+						shift
+						break
+					else
+						_log_level=""
+					fi
+				done
+			fi
 			_arg="${1}"
-			case ${_arg} in
-				-p)
+			if [[ ${_arg} == '-p' ]]; then
 					shift
 					_log_prefix="${1}"
 					shift
-					;;
-				*)
-					echo "log: Invalid option ${_arg} specified!"
-					exit
-					;;
-			esac
+			fi
+			_message="${*}"
+			break
 		done
-	else
-		_log_prefix=""
 	fi
-	_log_level=${1}
 	case ${_log_level} in
 		"DIE")
 				shift
-				write_log 2 ${_log_prefix:-"ERROR:"} "${*}"
+				write_log 2 ${_log_prefix:-"ERROR:"} "${_message}"
 				if [[ $(tty) != 'not a tty' && $(tty) != ${_logfile} ]]; then
 					exec 3>/dev/tty
 					>&3 echo "${_log_prefix:-"ERROR:"} Something goes wrong, check ${_logfile}!"
@@ -75,18 +83,18 @@ log() {
 				;;
 		"ERR")
 				shift
-				write_log 2 ${_log_prefix:-"ERROR:"} "${*}"
+				write_log 2 ${_log_prefix:-"ERROR:"} "${_message}"
 				;;
 		"WARN")
 				shift
-				write_log 1 ${_log_prefix:-"WARNING:"} "${*}"
+				write_log 1 ${_log_prefix:-"WARNING:"} "${_message}"
 				;;
 		"INFO")
 				shift
-				write_log 1 ${_log_prefix:-"INFO:"} "${*}"
+				write_log 1 ${_log_prefix:-"INFO:"} "${_message}"
 				;;
-		"*")
-				write_log 1 ${_log_prefix:-"INFO:"} "${*}"
+		*)
+				write_log 1 ${_log_prefix} "${_message}"
 				;;
 	esac
 }
