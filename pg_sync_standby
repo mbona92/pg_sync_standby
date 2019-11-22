@@ -164,7 +164,7 @@ copy_data () {
 			fi
 		fi
 		[ ${f_verbose} -eq 1 ] && v_flag="-v"
-		parallel_rsync ${d} "rsync -aSA ${v_flag} --bwlimit=${bwlimit:-0} --delete-excluded --delete --exclude=pg_wal/* --exclude=log/* --exclude=*.conf ${exclude_list} ${m_user}@${m_host}:${d}/ ${d}/"
+		parallel_rsync ${d} "rsync -aSA ${v_flag} --bwlimit=${bwlimit:-0} --delete --exclude=pg_wal/* --exclude=log/* --exclude=*.conf ${exclude_list} ${m_user}@${m_host}:${d}/ ${d}/"
 	done
 	for p in $(cat ${pid_file})
 	do
@@ -194,6 +194,8 @@ stop_bck() {
 bck_config_file() {
 	conn_string="${1}"
 	pgdata=${2}
+	bck_config_dir=${3}
+	pg_version=${4}
 	log INFO "Backing up configuration files..."
 	if [ ! -d ${bck_config_dir} ]; then
 		if ! errmsg=$(mkdir -p ${bck_config_dir}); then
@@ -221,11 +223,16 @@ bck_config_file() {
 			fi
 		fi
 	done
-	[ -f ${pgdata}/recovery.conf ] && cp ${pgdata}/recovery.conf ${bck_config_dir}/
-	[ -f ${pgdata}/recovery.done ] && cp ${pgdata}/recovery.done ${bck_config_dir}/
+	if [[ ${pg_version} -lt 120000 ]]; then
+		[ -f ${pgdata}/recovery.conf ] && cp ${pgdata}/recovery.conf ${bck_config_dir}/ && echo "recovery.conf ${pgdata}/recovery.conf" >> ${bck_config_dir}/conf_location_info
+		[ -f ${pgdata}/recovery.done ] && cp ${pgdata}/recovery.done ${bck_config_dir}/ && echo "recovery.done ${pgdata}/recovery.done" >> ${bck_config_dir}/conf_location_info
+	fi
 }
 
 restore_config_file() {
+	bck_config_dir=${1}
+	pgdata=${2}
+	pg_version=${3}
 	log INFO "Restoring configuration files from ${bck_config_dir}..."
 	if [ ! -f ${bck_config_dir}/conf_location_info ]; then
 		cp ${bck_config_dir}/*.conf ${pgdata}/
@@ -237,8 +244,9 @@ restore_config_file() {
 			cp -f ${bck_config_dir}/${src} ${dest}
 		done < <(cat ${bck_config_dir}/conf_location_info)
 	fi
-	[ -f ${bck_config_dir}/recovery.conf ] && cp ${bck_config_dir}/recovery.conf ${pgdata}/
-	[ -f ${bck_config_dir}/recovery.done ] && cp ${bck_config_dir}/recovery.done ${pgdata}/
+	if [[ ${pg_version} -ge 120000 ]]; then
+		touch ${pgdata}/standby.signal
+	fi
 }
 
 exclude_file_list() {
@@ -366,7 +374,6 @@ usage() {
 declare -i f_bck_conf_file=0
 declare -i f_verbose=0
 declare -i f_generate_config_file=0
-declare -i max_jobs=1
 declare -i r_jobs=0
 psql_out_opt="-A -t -X"
 wdir=$(realpath $(dirname $0))
@@ -606,7 +613,7 @@ m_user=${m_user:-${m_pguser}}
 m_host=${m_host:-${m_pghost}}
 start_cmd="${cl_start_cmd:-"${start_cmd}"}"
 stop_cmd="${cl_stop_cmd:-"${stop_cmd}"}"
-max_jobs="${cl_max_jobs:-"${max_jobs}"}"
+max_jobs="${cl_max_jobs:-"${max_jobs:-1}"}"
 
 if [ -n "${log_file}" ]; then
 	if touch "${log_file}" ]; then
@@ -630,23 +637,19 @@ fi
 check_pg_conn -d "${m_pgdatabase}" -h "${m_pghost}" -U "${m_pguser}" -p "${m_pgport}"
 [ $? -gt 0 ] && log DIE "Unable to connect to master database!"
 m_conn_string="-d ${m_pgdatabase} -h ${m_pghost} -U ${m_pguser} -p ${m_pgport}"
+# Retrieve pg version from master
+m_server_version_num=$(check_pg_version_num "${m_conn_string}")
 # Check connection to slave database
 if [[ ${stop_slave} == "true" ]]; then
 	if $(check_pg_conn -d "${s_pgdatabase}" -h "${s_pghost}" -U "${s_pguser}" -p "${s_pgport}" >/dev/null ); then
 		s_conn_string="-d ${s_pgdatabase} -h ${s_pghost} -U ${s_pguser} -p ${s_pgport}"
-		is_in_recovery=$(psql ${s_conn_string} ${psql_out_opt} -c "select pg_is_in_recovery()")
-		if [[ ${is_in_recovery} == 't' ]]; then
-			log DIE "Slave database is already in recovery mode!"
-		fi
 		# Backup slave configuration files before stop it
 		s_pgdata=$(psql ${s_conn_string} ${psql_out_opt} -c "show data_directory")
 		# Backup existing slave configuration files
-		[ -n "${bck_config_dir}" ] && bck_config_file "${s_conn_string}" ${s_pgdata}
+		[ -n "${bck_config_dir}" ] && bck_config_file "${s_conn_string}" ${s_pgdata} ${bck_config_dir} ${m_server_version_num}
 		stop_slave_db
 	fi
 fi
-# Retrieve pg version from master
-m_server_version_num=$(check_pg_version_num "${m_conn_string}")
 # Open connection to master database
 open_conn "${m_conn_string}"
 # Set arbitrary backup_label if not defined
@@ -672,16 +675,14 @@ copy_data ${pgdata}"|"${tbs_list}
 stop_bck ${m_server_version_num}
 # Close pg connection to master
 close_conn
+# Add recovery file if specified
+add_recovery_file
 if [ -n "${bck_config_dir}" ]; then
 	# Restore slave configuration files
-	restore_config_file
-	# Add recovery file if specified
-	add_recovery_file
+	restore_config_file ${bck_config_dir} ${pgdata} ${m_server_version_num}
 	# Start slave
 	[[ ${start_slave} == "true" ]] && start_slave_db
 else
-	# Add recovery file if specified
-	add_recovery_file
 	# Start slave
 	if [[ ${start_slave} == "true" ]]; then
 		log DIE "Cannot start slave without configutation file! Create or copy it in data directory and manually start database!"
