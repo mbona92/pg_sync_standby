@@ -297,6 +297,9 @@ stop_slave_db() {
 				run_custom_cmd ${stop_cmd}
 			else
 				# Try to stop slave with pg_ctl
+				if ! check_cmd_exists pg_ctl ; then
+					log DIE "pg_ctl command not found!"
+				fi
 				pg_ctl stop -m fast -D ${s_pgdata}
 			fi
 			if [ ${?} -gt 0 ]; then
@@ -639,9 +642,6 @@ if [[ ${stop_slave} == "true" ]]; then
 		s_pgdata=$(psql ${s_conn_string} ${psql_out_opt} -c "show data_directory")
 		# Backup existing slave configuration files
 		[ -n "${bck_config_dir}" ] && bck_config_file "${s_conn_string}" ${s_pgdata}
-		if ! check_cmd_exists pg_ctl ; then
-			log DIE "pg_ctl command not found!"
-		fi
 		stop_slave_db
 	fi
 fi
