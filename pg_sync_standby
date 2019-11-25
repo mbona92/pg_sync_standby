@@ -343,7 +343,7 @@ usage() {
 	echo "  -j                     use this many parallel jobs to rsync"
 	echo "  --bwlimit              specify bandwith limit according to the same option of rsync"
 	echo "  --start-slave          start database when sync finish"
-	echo "  --stop-slave           start database when sync finish"
+	echo "  --stop-slave           stop slave database"
 	echo "  --start-cmd            commad or bash script used to start slave. Must be specified within double quotes if contains spaces"
 	echo "  --stop-cmd             commad or bash script used to stop slave. Must be specified within double quotes if contains spaces"
 	echo "  --conf-dir             directory used to save configuration file. Must not be inside pgdata or tablespace"
