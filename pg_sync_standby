@@ -24,6 +24,7 @@ generate_config_file() {
 		# Sync options
 		m_host=
 		m_user=
+		pg_controldata=                                     # Path of pg_controldata binary in m_host
 		exclude_file=
 		bwlimit=
 		rsync_opt=
@@ -45,6 +46,12 @@ generate_config_file() {
 		else
 			return 1
 		fi
+	fi
+}
+
+check_ssh_connection() {
+	if ! errmsg=$(ssh -o LogLevel=error -o BatchMode=yes -o ConnectTimeout=5 ${1}@${2} echo Connect! 2>&1) ; then
+		log DIE "Cannot ssh connect to host ${2} using command \"ssh ${1}@${2}\" withouth password! Command failed with: ${errmsg}"
 	fi
 }
 
@@ -160,6 +167,9 @@ copy_data () {
 			fi
 		else
 			if [[ ${remove_slave_datafile} == "true" ]]; then
+				if [ -d ${d}/pg_wal ]; then
+					rm -rf ${d}/pg_wal/*
+				fi
 				rm -rf ${d}/*
 			fi
 		fi
@@ -244,9 +254,6 @@ restore_config_file() {
 			cp -f ${bck_config_dir}/${src} ${dest}
 		done < <(cat ${bck_config_dir}/conf_location_info)
 	fi
-	if [[ ${pg_version} -ge 120000 ]]; then
-		touch ${pgdata}/standby.signal
-	fi
 }
 
 exclude_file_list() {
@@ -266,6 +273,9 @@ start_bck() {
 	label=${1}
 	f_checkpoint=${2:-false}
 	pg_version=${3}
+	if ! ssh ${m_user}@${m_host} ${pg_controldata} -D ${pgdata} > /dev/null; then
+		log DIE "Cannot execute pg_controldata on ${m_host} host! Check if ${pg_controldata} exists!"
+	fi
 	log INFO "Executing pg_start_backup on master database..."
 	if [[ ${pg_version} -ge 90600 ]]; then
 		exclusive_bck="false"
@@ -281,6 +291,14 @@ start_bck() {
 			log DIE "An exclusive backup is already in progress"
 		fi
 	fi
+	# Check pg_controldata output
+	last_redo_location=$(ssh ${m_user}@${m_host} ${pg_controldata} -D ${pgdata} | grep "Latest checkpoint's REDO location:" | awk '{print $NF}')
+	while [[ ${start_wal} != ${last_redo_location} ]]
+	do
+		last_redo_location=$(ssh ${m_user}@${m_host} ${pg_controldata} -D ${pgdata} | grep "Latest checkpoint's REDO location:" | awk '{print $NF}')
+		sleep 1
+		log INFO "waiting for redo location ${last_redo_location} to be ${start_wal}"
+	done
 }
 
 start_slave_db() {
@@ -316,12 +334,16 @@ stop_slave_db() {
 }
 
 add_recovery_file() {
-	if [ -n "${recovery_file}" ]; then
-		if [ ! -f ${recovery_file} ]; then
-			log DIE "Recovery file ${recovery_file} does not exists!"
-		else
-			if ! cp ${recovery_file} ${pgdata}/ ; then
-				log DIE "Failed to copy recovery file ${recovery_file} to ${pgdata}!"
+	if [[ ${pg_version} -ge 120000 ]]; then
+		touch ${pgdata}/standby.signal
+	else
+		if [ -n "${recovery_file}" ]; then
+			if [ ! -f ${recovery_file} ]; then
+				log DIE "Recovery file ${recovery_file} does not exists!"
+			else
+				if ! cp ${recovery_file} ${pgdata}/ ; then
+					log DIE "Failed to copy recovery file ${recovery_file} to ${pgdata}!"
+				fi
 			fi
 		fi
 	fi
@@ -557,6 +579,12 @@ do
 			cl_m_user=${1}
 			shift
 			;;
+		--pg-controldata)
+			shift
+			[[ -z ${1} ]] && log -p "$(basename $0): " DIE "${arg}: missing argument"
+			cl_pg_controldata=${1}
+			shift
+			;;
 		--help)
 			shift
 			usage
@@ -599,6 +627,7 @@ s_pguser=${cl_s_pguser:-${s_pguser}}
 s_pgdatabase=${cl_s_pgdatabase:-${s_pgdatabase}}
 m_host=${cl_m_host:-${m_host}}
 m_user=${cl_m_user:-${m_user}}
+pg_controldata=${cl_pg_controldata:-${pg_controldata}}
 exclude_file=${cl_exclude_file:-${exclude_file}}
 bwlimit=${cl_bwlimit:-${bwlimit}}
 rsync_opt="${cl_rsync_opt:-"${rsync_opt}"}"
@@ -627,6 +656,9 @@ if [[ ${max_jobs} -le 0 ]]; then
 else
 	> ${pid_file}
 fi
+if [ -z "${pg_controldata}" ]; then
+	log DIE "pg_controldata path must be specified!"
+fi
 bwlimit_value=$(echo ${bwlimit} | sed -r 's/([0-9]+)(\w+?)/\1/')
 bwlimit_unit=$(echo ${bwlimit} | sed -r 's/([0-9]+)(\w+?)/\2/')
 if [[  ${bwlimit_value} -gt 0 ]]; then
@@ -636,28 +668,25 @@ fi
 # Check connection to master database
 check_pg_conn -d "${m_pgdatabase}" -h "${m_pghost}" -U "${m_pguser}" -p "${m_pgport}"
 [ $? -gt 0 ] && log DIE "Unable to connect to master database!"
+check_ssh_connection ${m_user} ${m_host}
 m_conn_string="-d ${m_pgdatabase} -h ${m_pghost} -U ${m_pguser} -p ${m_pgport}"
 # Retrieve pg version from master
 m_server_version_num=$(check_pg_version_num "${m_conn_string}")
 # Check connection to slave database
 if [[ ${stop_slave} == "true" ]]; then
-	if $(check_pg_conn -d "${s_pgdatabase}" -h "${s_pghost}" -U "${s_pguser}" -p "${s_pgport}" >/dev/null ); then
+	if check_pg_conn -d "${s_pgdatabase}" -h "${s_pghost}" -U "${s_pguser}" -p "${s_pgport}"; then
 		s_conn_string="-d ${s_pgdatabase} -h ${s_pghost} -U ${s_pguser} -p ${s_pgport}"
 		# Backup slave configuration files before stop it
 		s_pgdata=$(psql ${s_conn_string} ${psql_out_opt} -c "show data_directory")
 		# Backup existing slave configuration files
 		[ -n "${bck_config_dir}" ] && bck_config_file "${s_conn_string}" ${s_pgdata} ${bck_config_dir} ${m_server_version_num}
 		stop_slave_db
+	else
+		log DIE "Unable to connect to slave database!"
 	fi
 fi
 # Open connection to master database
 open_conn "${m_conn_string}"
-# Set arbitrary backup_label if not defined
-[[ -z ${backup_label} ]] && backup_label=$(echo "backup_start_$(date +"%F_%T")")
-# Start backup in master database
-start_bck ${backup_label} ${fast_checkpoint} ${m_server_version_num}
-# If exclude_file is defined make exclude_list
-[[ -n ${exclude_file} ]] && exclude_file_list
 # Get data_directory location
 echo "show data_directory;" >&${pg_conn[1]}
 pgdata=$(get_pg_output)
@@ -669,6 +698,12 @@ if [[ ${tbs_count} -gt 0 ]]; then
 	echo "select pg_tablespace_location(oid) from pg_tablespace where pg_tablespace_location(oid) <> '';" >&${pg_conn[1]}
 	tbs_list=$(get_pg_output)
 fi
+# Set arbitrary backup_label if not defined
+[[ -z ${backup_label} ]] && backup_label=$(echo "backup_start_$(date +"%F_%T")")
+# Start backup in master database
+start_bck ${backup_label} ${fast_checkpoint} ${m_server_version_num}
+# If exclude_file is defined make exclude_list
+[[ -n ${exclude_file} ]] && exclude_file_list
 # Copy data_directory and tbs content
 copy_data ${pgdata}"|"${tbs_list}
 # Stop backup
